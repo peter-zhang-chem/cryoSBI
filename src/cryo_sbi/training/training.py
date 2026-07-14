@@ -195,6 +195,8 @@ def train_classifier(cfg: DictConfig) -> None:
     image_cfg = cfg.simulation
 
     batch_size = train_cfg.batch_size
+    print(f"simulation_batch_size = {simulation_batch_size}")
+    print(f"batch_size = {batch_size}")
     assert simulation_batch_size >= batch_size
     assert simulation_batch_size % batch_size == 0
 

@@ -1,6 +1,12 @@
 import os
 import time
 import logging
+import math
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import torch.nn.functional as F
 
 import torch
 import torch.nn as nn
@@ -170,6 +176,288 @@ def _load_checkpoint(
     logging.info(f"Resuming from {path} at epoch {start_epoch}")
     return start_epoch
 
+# training diagnostic functions
+def labels_from_parameters(parameters, simulator):
+    """Convert simulator parameters into classifier labels."""
+    fg_indices = parameters[0]
+
+    if fg_indices.ndim == 2:
+        labels = fg_indices[:, 0].long().clone()
+    else:
+        labels = fg_indices.long().clone()
+    
+    if simulator.garbage_class:
+        garbage_mask = parameters[13].bool()
+        labels[garbage_mask] = simulator.num_models
+
+    return labels
+
+@torch.no_grad()
+def evaluate_probe_set(
+    estimator,
+    probe_images,
+    probe_labels,
+    device,
+    num_classes,
+    batch_size,
+):
+    """Evaluate the current model on the fixed diagnostic images."""
+    was_training = estimator.training
+    estimator.eval()
+
+    logits_list = []
+
+    for start in range(0, len(probe_images), batch_size):
+        end = start + batch_size
+
+        images = probe_images[start:end].to(
+            device,
+            non_blocking=True,
+        )
+
+        logits = estimator(images)
+        logits_list.append(logits.float().cpu())
+    
+    if was_training:
+        estimator.train()
+
+    logits = torch.cat(logits_list, dim=0)
+    probabilities = logits.softmax(dim=1)
+    predictions = logits.argmax(dim=1)
+
+    # Keep one loss value per image
+    image_losses = F.cross_entropy(
+        logits,
+        probe_labels,
+        reduction="none",
+    )
+
+    correct = predictions.eq(probe_labels)
+
+    class_counts = torch.bincount(
+        probe_labels,
+        minlength=num_classes,
+    ).float()
+
+    class_correct = torch.bincount(
+        probe_labels,
+        weights=correct.float(),
+        minlength=num_classes,
+    )
+
+    class_loss_sum = torch.bincount(
+        probe_labels,
+        weights=image_losses,
+        minlength=num_classes,
+    )
+
+    valid_classes = class_counts > 0
+
+    class_accuracy = torch.full(
+        (num_classes,),
+        float("nan"),
+    )
+
+    class_loss = torch.full(
+        (num_classes,),
+        float("nan"),
+    )
+
+    class_accuracy[valid_classes] = (
+        class_correct[valid_classes]
+        / class_counts[valid_classes]
+    )
+
+    class_loss[valid_classes] = (
+        class_loss_sum[valid_classes]
+        / class_counts[valid_classes]
+    )
+
+    macro_accuracy = class_accuracy[valid_classes].mean()
+
+    true_class_probability = probabilities.gather(
+        1,
+        probe_labels[:, None],
+    ).squeeze(1)
+
+    predicted_probability = probabilities.max(dim=1).values
+
+    flat_confusion_indices = (
+        probe_labels * num_classes + predictions
+    )
+
+    confusion_matrix = torch.bincount(
+        flat_confusion_indices,
+        minlength=num_classes * num_classes,
+    ).reshape(num_classes, num_classes)
+
+    return {
+        "accuracy": correct.float().mean(),
+        "macro_accuracy": macro_accuracy,
+        "mean_loss": image_losses.mean(),
+        "class_accuracy": class_accuracy,
+        "class_loss": class_loss,
+        "class_counts": class_counts,
+        "image_losses": image_losses,
+        "predictions": predictions,
+        "true_probability": true_class_probability,
+        "predicted_probability": predicted_probability,
+        "confusion_matrix": confusion_matrix,
+    }
+
+def make_confusion_figure(confusion_matrix, class_names):
+    """Create a row-normalized confusion_matrix figure."""
+    confusion = confusion_matrix.float()
+
+    confusion = confusion / confusion.sum(
+        dim=1,
+        keepdim=True,
+    ).clamp_min(1)
+
+    n_classes = len(class_names)
+    figure_size = min(18, max(6, n_classes * 0.65))
+
+    fig, ax = plt.subplots(
+        figsize=(figure_size, figure_size)
+    )
+
+    image = ax.imshow(
+        confusion.numpy(),
+        vmin=0,
+        vmax=1,
+        aspect="auto",
+    )
+
+    if n_classes <= 30:
+        tick_indices = list(range(n_classes))
+    else:
+        tick_step = math.ceil(n_classes / 20)
+        tick_indices = list(range(0, n_classes, tick_step))
+
+    ax.set_xticks(tick_indices)
+    ax.set_yticks(tick_indices)
+
+    ax.set_xticklabels(
+        [class_names[i] for i in tick_indices],
+        rotation=90,
+        fontsize=7,
+    )
+
+    ax.set_yticklabels(
+        [class_names[i] for i in tick_indices],
+        fontsize=7,
+    )
+
+    ax.set_xlabel("Predicted conformation")
+    ax.set_ylabel("True conformation")
+    ax.set_title("Confusion matrix against fixed probe set")
+
+    fig.colorbar(image, ax=ax, label="Fraction of true class")
+    fig.tight_layout()
+
+    return fig
+
+def make_hard_examples_figure(
+    probe_images,
+    probe_parameters,
+    probe_labels,
+    results,
+    class_names,
+    max_images=16,
+):
+    """Show the highest-loss misclassified probe images."""
+    predictions = results["predictions"]
+    losses = results["image_losses"]
+    true_probability = results["true_probability"]
+    predicted_probability = results["predicted_probability"]
+
+    wrong_indices = torch.where(
+        predictions != probe_labels
+    )[0]
+
+    # If everything is classified correctly, show the
+    # highest-loss correctly classified images instead.
+    if wrong_indices.numel() == 0:
+        candidate_indices = torch.arange(len(probe_labels))
+    else:
+        candidate_indices = wrong_indices
+
+    order = torch.argsort(
+        losses[candidate_indices],
+        descending=True,
+    )
+
+    selected = candidate_indices[order[:max_images]]
+
+    n_columns = 4
+    n_rows = max(1, math.ceil(len(selected) / n_columns))
+
+    fig, axes_array = plt.subplots(
+        n_rows,
+        n_columns,
+        figsize=(12, 3.4 * n_rows),
+        squeeze=False,
+    )
+
+    axes = axes_array.ravel()
+
+    for ax, image_index in zip(axes, selected.tolist()):
+        true_class = int(probe_labels[image_index])
+        predicted_class = int(predictions[image_index])
+
+        # Simulator parameter positions:
+        # 3 = shift
+        # 4 = defocus
+        # 7 = log10(SNR)
+        shift = float(
+            probe_parameters[3][image_index].norm()
+        )
+
+        defocus = float(
+            probe_parameters[4][image_index]
+            .reshape(-1)[0]
+        )
+
+        log10_snr = float(
+            probe_parameters[7][image_index]
+            .reshape(-1)[0]
+        )
+
+        snr = 10.0 ** log10_snr
+
+        image = (
+            probe_images[image_index]
+            .detach()
+            .cpu()
+            .numpy()
+        )
+
+        ax.imshow(
+            image,
+            cmap="gray",
+        )
+
+        ax.set_title(
+            f"True: {class_names[true_class]}\n"
+            f"Pred: {class_names[predicted_class]}\n"
+            f"loss={losses[image_index].item():.2f}, "
+            f"p(true)={true_probability[image_index].item():.2f}, "
+            f"p(pred)={predicted_probability[image_index].item():.2f}\n"
+            f"SNR={snr:.3f}, "
+            f"defocus={defocus:.2f}, "
+            f"shift={shift:.1f} Å",
+            fontsize=8,
+        )
+
+        ax.axis("off")
+
+    # Hide unused subplot positions.
+    for ax in axes[len(selected):]:
+        ax.axis("off")
+
+    fig.tight_layout()
+
+    return fig
 
 def train_classifier(cfg: DictConfig) -> None:
     """
@@ -279,6 +567,87 @@ def train_classifier(cfg: DictConfig) -> None:
     # TensorBoard
     writer = SummaryWriter(log_dir=cfg.train.output.tensorboard_dir)
 
+    # ---------------------------------------------------------
+    # Fixed diagnostic/probe set
+    # ---------------------------------------------------------
+
+    PROBE_EVERY_N_EPOCHS = 5
+
+    # For your current 10 conformations plus garbage,
+    # this produces roughly 90 images per class.
+    probe_size = max(1024, num_classes * 32)
+
+    # Save RNG state so generating the probe set does not
+    # change the subsequent training random sequence.
+    cpu_rng_state = torch.get_rng_state()
+
+    cuda_rng_state = (
+        torch.cuda.get_rng_state_all()
+        if torch.cuda.is_available()
+        else None
+    )
+
+    torch.manual_seed(12345)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(12345)
+
+    with torch.no_grad():
+        probe_images, probe_parameters = (
+            simulator.sample_and_simulate(
+                num_sim=probe_size,
+                return_parameters=True,
+                batch_size=simulation_batch_size,
+            )
+        )
+    probe_images = probe_images.detach().cpu()
+
+    probe_parameters = [
+        parameter.detach().cpu()
+        for parameter in probe_parameters
+    ]
+
+    probe_labels = labels_from_parameters(
+        probe_parameters,
+        simulator,
+    ).cpu()
+
+    # Restore the training RNG state.
+    torch.set_rng_state(cpu_rng_state)
+
+    if cuda_rng_state is not None:
+        torch.cuda.set_rng_state_all(cuda_rng_state)
+
+    # Replace these generic names with the actual PDB names,
+    # in exactly the same order used to create models_cryosbi.pt.
+    class_names = [
+        f"conformation_{i:03d}"
+        for i in range(simulator.num_models)
+    ]
+
+    if simulator.garbage_class:
+        class_names.append("garbage")
+
+    probe_class_counts = torch.bincount(
+        probe_labels,
+        minlength=num_classes,
+    )
+
+    class_map_text = "\n".join(
+        f"{i}: {name} ({int(probe_class_counts[i])} probe images)"
+        for i, name in enumerate(class_names)
+    )
+
+    writer.add_text(
+        "Probe/class_index_map",
+        class_map_text,
+        global_step=0,
+    )
+
+    logging.info(
+        f"Created fixed probe set with {len(probe_images)} images"
+    )
+
     os.makedirs(cfg.train.output.checkpoint_dir, exist_ok=True)
     estimator_file = cfg.train.output.estimator_file
     os.makedirs(os.path.dirname(estimator_file) or ".", exist_ok=True)
@@ -347,12 +716,127 @@ def train_classifier(cfg: DictConfig) -> None:
             writer.add_scalar("Accuracy/epoch", mean_acc, epoch)
             writer.add_scalar("LR/epoch", current_lr, epoch)
             writer.add_scalar("Throughput/epoch", throughput, epoch)
+
+            if (
+                epoch == start_epoch
+                or (epoch + 1) % PROBE_EVERY_N_EPOCHS == 0
+            ):
+                probe_results = evaluate_probe_set(
+                    estimator=estimator,
+                    probe_images=probe_images,
+                    probe_labels=probe_labels,
+                    device=device,
+                    num_classes=num_classes,
+                    batch_size=batch_size,
+                )
+
+                writer.add_scalar(
+                    "Probe/overall_accuracy",
+                    probe_results["accuracy"].item(),
+                    epoch,
+                )
+
+                writer.add_scalar(
+                    "Probe/macro_accuracy",
+                    probe_results["macro_accuracy"].item(),
+                    epoch,
+                )
+
+                writer.add_scalar(
+                    "Probe/mean_loss",
+                    probe_results["mean_loss"].item(),
+                    epoch,
+                )
+
+                # One scalar curve for every conformation.
+                for class_index, class_name in enumerate(class_names):
+                    safe_name = class_name.replace("/", "_")
+
+                    writer.add_scalar(
+                        f"ProbeAccuracyByClass/{safe_name}",
+                        probe_results["class_accuracy"][class_index].item(),
+                        epoch,
+                    )
+
+                    writer.add_scalar(
+                        f"ProbeLossByClass/{safe_name}",
+                        probe_results["class_loss"][class_index].item(),
+                        epoch,
+                    )
+
+                # Text table showing the hardest conformations.
+                accuracy_for_sorting = torch.nan_to_num(
+                    probe_results["class_accuracy"],
+                    nan=1.0,
+                )
+
+                hardest_classes = torch.argsort(
+                    accuracy_for_sorting
+                )
+
+                summary_lines = [
+                    "| Rank | Conformation | Accuracy | Mean loss | Images |",
+                    "|---:|---|---:|---:|---:|",
+                ]
+
+                for rank, class_index in enumerate(
+                    hardest_classes[: min(10, num_classes)].tolist(),
+                    start=1,
+                ):
+                    summary_lines.append(
+                        f"| {rank} | {class_names[class_index]} | "
+                        f"{probe_results['class_accuracy'][class_index]:.3f} | "
+                        f"{probe_results['class_loss'][class_index]:.3f} | "
+                        f"{int(probe_results['class_counts'][class_index])} |"
+                    )
+
+                writer.add_text(
+                    "Probe/hardest_conformations",
+                    "\n".join(summary_lines),
+                    epoch,
+                )
+
+                confusion_figure = make_confusion_figure(
+                    probe_results["confusion_matrix"],
+                    class_names,
+                )
+
+                writer.add_figure(
+                    "Probe/confusion_matrix",
+                    confusion_figure,
+                    epoch,
+                )
+
+                plt.close(confusion_figure)
+
+                hard_examples_figure = make_hard_examples_figure(
+                    probe_images=probe_images,
+                    probe_parameters=probe_parameters,
+                    probe_labels=probe_labels,
+                    results=probe_results,
+                    class_names=class_names,
+                    max_images=16,
+                )
+
+                writer.add_figure(
+                    "Probe/hardest_images",
+                    hard_examples_figure,
+                    epoch,
+                )
+
+                plt.close(hard_examples_figure)
+
+                writer.flush()
+        
             tq.set_postfix(loss=mean_loss, acc=f"{mean_acc:.3f}", lr=current_lr)
             final_loss, final_acc = mean_loss, mean_acc
 
             # Save after the epoch completes; (epoch+1) so we never save an
             # untrained model at epoch 0 and we always save the final epoch.
-            if (epoch + 1) % saving_frequency == 0:
+            if (
+                (epoch + 1) % saving_frequency == 0
+                or (epoch + 1) == epochs
+            ):
                 ckpt_path = os.path.join(
                     cfg.train.output.checkpoint_dir, f"checkpoint_epoch_{epoch + 1}.pt"
                 )

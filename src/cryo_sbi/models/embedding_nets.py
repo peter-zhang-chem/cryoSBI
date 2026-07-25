@@ -193,6 +193,30 @@ class RegNetY_Encoder(nn.Module):
         x = self.regnety(x)
         return x
 
+@add_embedding("REGNETY_HIRES")
+class RegNetYHiResEncoder(nn.Module):
+    def __init__(self, out_dim: int):
+        super().__init__()
+
+        self.regnety = models.regnet_y_1_6gf(weights=None)
+
+        self.regnety.stem[0] = nn.Conv2d(
+            in_channels=1,
+            out_channels=32,
+            kernel_size=3,
+            stride=1,       # changed from 2 to 1
+            padding=1,
+            bias=False,
+        )
+
+        in_features = self.regnety.fc.in_features
+        self.regnety.fc = nn.Linear(in_features, out_dim)
+
+    def forward(self, x):
+        if x.ndim == 3:
+            x = x.unsqueeze(1)
+
+        return self.regnety(x)
 
 @add_embedding("SHUFFLENET")
 class ShuffleNet_Encoder(nn.Module):

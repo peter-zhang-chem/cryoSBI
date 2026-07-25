@@ -537,6 +537,7 @@ def train_classifier(cfg: DictConfig) -> None:
             optimizer,
             max_lr=train_cfg.learning_rate,
             total_steps=epochs * batches_per_epoch * (simulation_batch_size // batch_size),
+            pct_start=cfg.train.get("pct_start", 0.3)
         )
 
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)

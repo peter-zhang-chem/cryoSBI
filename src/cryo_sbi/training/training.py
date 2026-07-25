@@ -459,6 +459,215 @@ def make_hard_examples_figure(
 
     return fig
 
+def summarize_probe_by_snr(
+    probe_results,
+    probe_labels,
+    probe_snr,
+    num_structure_classes,
+    snr_bins,
+):
+    """Calculate probe metrics separately for each SNR interval."""
+
+    predictions = probe_results["predictions"]
+    image_losses = probe_results["image_losses"]
+    correct = predictions.eq(probe_labels)
+
+    summaries = {}
+
+    for bin_index, (lower, upper) in enumerate(snr_bins):
+        # Include the upper endpoint only in the final bin.
+        if bin_index == len(snr_bins) - 1:
+            snr_mask = (
+                (probe_snr >= lower)
+                & (probe_snr <= upper)
+            )
+        else:
+            snr_mask = (
+                (probe_snr >= lower)
+                & (probe_snr < upper)
+            )
+
+        if not snr_mask.any():
+            continue
+
+        # Exclude garbage from structural metrics.
+        structure_mask = (
+            snr_mask
+            & (probe_labels < num_structure_classes)
+        )
+
+        structure_labels = probe_labels[structure_mask]
+        structure_correct = correct[structure_mask]
+
+        class_counts = torch.bincount(
+            structure_labels,
+            minlength=num_structure_classes,
+        ).float()
+
+        class_correct = torch.bincount(
+            structure_labels,
+            weights=structure_correct.float(),
+            minlength=num_structure_classes,
+        )
+
+        valid_classes = class_counts > 0
+
+        class_accuracy = torch.full(
+            (num_structure_classes,),
+            float("nan"),
+        )
+
+        class_accuracy[valid_classes] = (
+            class_correct[valid_classes]
+            / class_counts[valid_classes]
+        )
+
+        tag = f"{lower:.2f}-{upper:.2f}"
+
+        summaries[tag] = {
+            # Includes structural and garbage images.
+            "all_accuracy": correct[snr_mask].float().mean(),
+
+            # Structural images pooled together.
+            "structure_accuracy": (
+                structure_correct.float().mean()
+            ),
+
+            # Each structural conformation has equal weight.
+            "structure_macro_accuracy": (
+                class_accuracy[valid_classes].mean()
+            ),
+
+            # Accuracy of the most difficult structural class.
+            "worst_class_accuracy": (
+                class_accuracy[valid_classes].min()
+            ),
+
+            "mean_loss": image_losses[snr_mask].mean(),
+            "count": int(snr_mask.sum()),
+            "structure_count": int(structure_mask.sum()),
+            "class_accuracy": class_accuracy,
+        }
+
+    return summaries
+
+def log_probe_diagnostics(
+    estimator,
+    probe_images,
+    probe_parameters,
+    probe_labels,
+    probe_snr,
+    simulator,
+    class_names,
+    num_classes,
+    device,
+    batch_size,
+    writer,
+    step,
+):
+    probe_results = evaluate_probe_set(
+        estimator=estimator,
+        probe_images=probe_images,
+        probe_labels=probe_labels,
+        device=device,
+        num_classes=num_classes,
+        batch_size=batch_size,
+    )
+
+    snr_bins = [
+        (0.20, 0.30),
+        (0.30, 0.50),
+        (0.50, 1.00),
+    ]
+
+    snr_results = summarize_probe_by_snr(
+        probe_results=probe_results,
+        probe_labels=probe_labels,
+        probe_snr=probe_snr,
+        num_structure_classes=simulator.num_models,
+        snr_bins=snr_bins,
+    )
+
+    for snr_tag, metrics in snr_results.items():
+        writer.add_scalar(
+            f"ProbeBySNR/AllAccuracy_{snr_tag}",
+            metrics["all_accuracy"].item(),
+            step,
+        )
+
+        writer.add_scalar(
+            f"ProbeBySNR/StructureAccuracy_{snr_tag}",
+            metrics["structure_accuracy"].item(),
+            step,
+        )
+
+        writer.add_scalar(
+            f"ProbeBySNR/StructureMacroAccuracy_{snr_tag}",
+            metrics["structure_macro_accuracy"].item(),
+            step,
+        )
+
+        writer.add_scalar(
+            f"ProbeBySNR/WorstClassAccuracy_{snr_tag}",
+            metrics["worst_class_accuracy"].item(),
+            step,
+        )
+
+        writer.add_scalar(
+            f"ProbeBySNR/MeanLoss_{snr_tag}",
+            metrics["mean_loss"].item(),
+            step,
+        )
+
+        for class_index in range(simulator.num_models):
+            class_accuracy = metrics["class_accuracy"][class_index]
+
+            if torch.isfinite(class_accuracy):
+                safe_name = class_names[class_index].replace("/", "_")
+
+                writer.add_scalar(
+                    f"ProbeBySNRClass/{snr_tag}_{safe_name}",
+                    class_accuracy.item(),
+                    step,
+                )
+
+    writer.add_scalar(
+        "Probe/overall_accuracy",
+        probe_results["accuracy"].item(),
+        step,
+    )
+
+    writer.add_scalar(
+        "Probe/macro_accuracy",
+        probe_results["macro_accuracy"].item(),
+        step,
+    )
+
+    writer.add_scalar(
+        "Probe/mean_loss",
+        probe_results["mean_loss"].item(),
+        step,
+    )
+
+    for class_index, class_name in enumerate(class_names):
+        safe_name = class_name.replace("/", "_")
+
+        writer.add_scalar(
+            f"ProbeAccuracyByClass/{safe_name}",
+            probe_results["class_accuracy"][class_index].item(),
+            step,
+        )
+
+        writer.add_scalar(
+            f"ProbeLossByClass/{safe_name}",
+            probe_results["class_loss"][class_index].item(),
+            step,
+        )
+
+    writer.flush()
+
+    return probe_results
+
 def train_classifier(cfg: DictConfig) -> None:
     """
     Main training function.
@@ -574,9 +783,7 @@ def train_classifier(cfg: DictConfig) -> None:
 
     PROBE_EVERY_N_EPOCHS = 5
 
-    # For your current 10 conformations plus garbage,
-    # this produces roughly 90 images per class.
-    probe_size = max(1024, num_classes * 32)
+    probe_size = max(8192, num_classes * 32)
 
     # Save RNG state so generating the probe set does not
     # change the subsequent training random sequence.
@@ -612,6 +819,12 @@ def train_classifier(cfg: DictConfig) -> None:
         probe_parameters,
         simulator,
     ).cpu()
+
+    # Simulator parameter 7 is log10(SNR)
+    probe_snr = torch.pow(
+        10.0,
+        probe_parameters[7].reshape(-1).float()
+    )
 
     # Restore the training RNG state.
     torch.set_rng_state(cpu_rng_state)
@@ -654,6 +867,21 @@ def train_classifier(cfg: DictConfig) -> None:
     os.makedirs(os.path.dirname(estimator_file) or ".", exist_ok=True)
 
     logging.info("Starting training loop")
+
+    log_probe_diagnostics(
+        estimator=estimator,
+        probe_images=probe_images,
+        probe_parameters=probe_parameters,
+        probe_labels=probe_labels,
+        probe_snr=probe_snr,
+        simulator=simulator,
+        class_names=class_names,
+        num_classes=num_classes,
+        device=device,
+        batch_size=batch_size,
+        writer=writer,
+        step=start_epoch,
+    )
     start_time = time.time()
     estimator.train()
     final_loss = float("nan")
@@ -718,52 +946,128 @@ def train_classifier(cfg: DictConfig) -> None:
             writer.add_scalar("LR/epoch", current_lr, epoch)
             writer.add_scalar("Throughput/epoch", throughput, epoch)
 
-            if (
-                epoch == start_epoch
-                or (epoch + 1) % PROBE_EVERY_N_EPOCHS == 0
-            ):
-                probe_results = evaluate_probe_set(
+            epoch_step = epoch + 1
+
+            if epoch_step % PROBE_EVERY_N_EPOCHS == 0:
+                probe_results = log_probe_diagnostics(
                     estimator=estimator,
                     probe_images=probe_images,
+                    probe_parameters=probe_parameters,
                     probe_labels=probe_labels,
-                    device=device,
+                    probe_snr=probe_snr,
+                    simulator=simulator,
+                    class_names=class_names,
                     num_classes=num_classes,
+                    device=device,
                     batch_size=batch_size,
+                    writer=writer,
+                    step=epoch_step,
                 )
 
-                writer.add_scalar(
-                    "Probe/overall_accuracy",
-                    probe_results["accuracy"].item(),
-                    epoch,
-                )
+            # if (
+            #     epoch == start_epoch
+            #     or (epoch + 1) % PROBE_EVERY_N_EPOCHS == 0
+            # ):
+            #     probe_results = evaluate_probe_set(
+            #         estimator=estimator,
+            #         probe_images=probe_images,
+            #         probe_labels=probe_labels,
+            #         device=device,
+            #         num_classes=num_classes,
+            #         batch_size=batch_size,
+            #     )
+                
+            #     snr_bins = [
+            #         (0.10, 0.30),
+            #         (0.30, 0.50),
+            #         (0.50, 1.00),
+            #     ]
 
-                writer.add_scalar(
-                    "Probe/macro_accuracy",
-                    probe_results["macro_accuracy"].item(),
-                    epoch,
-                )
+            #     snr_results = summarize_probe_by_snr(
+            #         probe_results=probe_results,
+            #         probe_labels=probe_labels,
+            #         probe_snr=probe_snr,
+            #         num_structure_classes=simulator.num_models,
+            #         snr_bins=snr_bins,
+            #     )
 
-                writer.add_scalar(
-                    "Probe/mean_loss",
-                    probe_results["mean_loss"].item(),
-                    epoch,
-                )
+            #     for snr_tag, metrics in snr_results.items():
+            #         writer.add_scalar(
+            #             f"ProbeBySNR/AllAccuracy_{snr_tag}",
+            #             metrics["all_accuracy"].item(),
+            #             epoch,
+            #         )
+
+            #         writer.add_scalar(
+            #             f"ProbeBySNR/StructureAccuracy_{snr_tag}",
+            #             metrics["structure_accuracy"].item(),
+            #             epoch,
+            #         )
+
+            #         writer.add_scalar(
+            #             f"ProbeBySNR/StructureMacroAccuracy_{snr_tag}",
+            #             metrics["structure_macro_accuracy"].item(),
+            #             epoch,
+            #         )
+
+            #         writer.add_scalar(
+            #             f"ProbeBySNR/WorstClassAccuracy_{snr_tag}",
+            #             metrics["worst_class_accuracy"].item(),
+            #             epoch,
+            #         )
+
+            #         writer.add_scalar(
+            #             f"ProbeBySNR/MeanLoss_{snr_tag}",
+            #             metrics["mean_loss"].item(),
+            #             epoch,
+            #         )
+
+            #         # Log each structural class within each SNR interval.
+            #         for class_index in range(simulator.num_models):
+            #             class_accuracy = metrics["class_accuracy"][class_index]
+
+            #             if torch.isfinite(class_accuracy):
+            #                 safe_name = class_names[class_index].replace("/", "_")
+
+            #                 writer.add_scalar(
+            #                     f"ProbeBySNRClass/{snr_tag}_{safe_name}",
+            #                     class_accuracy.item(),
+            #                     epoch,
+            #                 )
+
+            #     writer.add_scalar(
+            #         "Probe/overall_accuracy",
+            #         probe_results["accuracy"].item(),
+            #         epoch,
+            #     )
+
+            #     writer.add_scalar(
+            #         "Probe/macro_accuracy",
+            #         probe_results["macro_accuracy"].item(),
+            #         epoch,
+            #     )
+
+            #     writer.add_scalar(
+            #         "Probe/mean_loss",
+            #         probe_results["mean_loss"].item(),
+            #         epoch,
+            #     )
 
                 # One scalar curve for every conformation.
-                for class_index, class_name in enumerate(class_names):
-                    safe_name = class_name.replace("/", "_")
+                # for class_index, class_name in enumerate(class_names):
+                #     safe_name = class_name.replace("/", "_")
 
-                    writer.add_scalar(
-                        f"ProbeAccuracyByClass/{safe_name}",
-                        probe_results["class_accuracy"][class_index].item(),
-                        epoch,
-                    )
+                #     writer.add_scalar(
+                #         f"ProbeAccuracyByClass/{safe_name}",
+                #         probe_results["class_accuracy"][class_index].item(),
+                #         epoch,
+                #     )
 
-                    writer.add_scalar(
-                        f"ProbeLossByClass/{safe_name}",
-                        probe_results["class_loss"][class_index].item(),
-                        epoch,
-                    )
+                #     writer.add_scalar(
+                #         f"ProbeLossByClass/{safe_name}",
+                #         probe_results["class_loss"][class_index].item(),
+                #         epoch,
+                #     )
 
                 # Text table showing the hardest conformations.
                 accuracy_for_sorting = torch.nan_to_num(
@@ -794,7 +1098,7 @@ def train_classifier(cfg: DictConfig) -> None:
                 writer.add_text(
                     "Probe/hardest_conformations",
                     "\n".join(summary_lines),
-                    epoch,
+                    epoch_step,
                 )
 
                 confusion_figure = make_confusion_figure(
@@ -805,7 +1109,7 @@ def train_classifier(cfg: DictConfig) -> None:
                 writer.add_figure(
                     "Probe/confusion_matrix",
                     confusion_figure,
-                    epoch,
+                    epoch_step,
                 )
 
                 plt.close(confusion_figure)
@@ -822,7 +1126,7 @@ def train_classifier(cfg: DictConfig) -> None:
                 writer.add_figure(
                     "Probe/hardest_images",
                     hard_examples_figure,
-                    epoch,
+                    epoch_step,
                 )
 
                 plt.close(hard_examples_figure)

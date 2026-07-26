@@ -1,6 +1,7 @@
+import torch
 import torch.nn as nn
 import torchvision.models as models
-
+import torch.nn.functional as F
 
 EMBEDDING_NETS = {}
 
@@ -218,6 +219,44 @@ class RegNetYHiResEncoder(nn.Module):
 
         return self.regnety(x)
 
+@add_embedding("REGNETY_MULTISCALE")
+class RegNetYMultiscaleEncoder(nn.Module):
+    def __init__(self, out_dim: int):
+        super().__init__()
+
+        self.regnety = models.regnet_y_1_6gf(weights=None)
+
+        self.regnety.stem[0] = nn.Conv2d(
+            1,
+            32,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False,
+        )
+
+        # The input size will be inferred after the first forward pass.
+        self.projection = nn.LazyLinear(out_dim)
+
+    def forward(self, x):
+        if x.ndim == 3:
+            x = x.unsqueeze(1)
+
+        x = self.regnety.stem(x)
+
+        pooled_features = []
+
+        for stage in self.regnety.trunk_output:
+            x = stage(x)
+            pooled = F.adaptive_avg_pool2d(x, output_size=1)
+            pooled_features.append(pooled.flatten(start_dim=1))
+
+        # Use the final three spatial scales.
+        x = torch.cat(pooled_features[-3:], dim=1)
+        x = self.projection(x)
+
+        return x
+    
 @add_embedding("SHUFFLENET")
 class ShuffleNet_Encoder(nn.Module):
     def __init__(self, out_dim: int):

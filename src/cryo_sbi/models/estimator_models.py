@@ -36,7 +36,7 @@ class MLPClassifier(BaseClassifier):
         num_layers=3,
         nodes_per_layer=128,
         activation=nn.ReLU,
-        dropout=0.0,
+        dropout=0.05,
     ):
         super().__init__(input_dim, num_classes)
 
